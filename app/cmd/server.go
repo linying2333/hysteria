@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary" // 新增: 用于处理 PROXY Protocol v2 的大小端转换
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -240,6 +241,8 @@ type serverConfigMasqueradeFile struct {
 type serverConfigMasqueradeProxy struct {
 	URL         string `mapstructure:"url"`
 	RewriteHost bool   `mapstructure:"rewriteHost"`
+	RewriteSNI   bool   `mapstructure:"rewriteSNI"` // 新增: 是否重写 TLS SNI
+	RealIpHeader string `mapstructure:"realIpHeader"` // 新增: 传递真实 IP 的方式
 	Insecure    bool   `mapstructure:"insecure"`
 }
 
@@ -802,6 +805,58 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	return nil
 }
 
+// 新增: 辅助函数构造并发送 PROXY Protocol 报头
+func writeProxyProtocol(conn net.Conn, remoteAddr string, version int) error {
+	remoteIP, remotePortStr, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return err
+	}
+	remotePort, _ := strconv.Atoi(remotePortStr)
+
+	localIP, localPortStr, _ := net.SplitHostPort(conn.LocalAddr().String())
+	localPort, _ := strconv.Atoi(localPortStr)
+
+	if version == 1 {
+		// PROXY TCP4/6 srcIP dstIP srcPort dstPort\r\n
+		family := "TCP4"
+		if strings.Contains(remoteIP, ":") {
+			family = "TCP6"
+		}
+		header := fmt.Sprintf("PROXY %s %s %s %d %d\r\n", family, remoteIP, localIP, remotePort, localPort)
+		_, err = conn.Write([]byte(header))
+		return err
+	} else if version == 2 {
+		// PROXY Protocol v2 (Binary)
+		header := []byte("\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A") // Sig
+		header = append(header, 0x21) // Ver 2 | Command Proxy
+		
+		srcIP := net.ParseIP(remoteIP)
+		dstIP := net.ParseIP(localIP)
+
+		if srcIP.To4() != nil {
+			header = append(header, 0x11) // AF_INET | STREAM
+			header = append(header, 0x00, 0x0C) // Length: 12
+			header = append(header, srcIP.To4()...)
+			header = append(header, dstIP.To4()...)
+		} else {
+			header = append(header, 0x21) // AF_INET6 | STREAM
+			header = append(header, 0x00, 0x24) // Length: 36
+			header = append(header, srcIP.To16()...)
+			header = append(header, dstIP.To16()...)
+		}
+		
+		pBuf := make([]byte, 4)
+		binary.BigEndian.PutUint16(pBuf[0:2], uint16(remotePort))
+		binary.BigEndian.PutUint16(pBuf[2:4], uint16(localPort))
+		header = append(header, pBuf...)
+		
+		_, err = conn.Write(header)
+		return err
+	}
+	return nil
+}
+
+// 新增: 修改 proxy 逻辑, 实现透传SNI,RealIP
 // fillMasqHandler must be called after fillConn, as we may need to extract the QUIC
 // port number from Conn for MasqTCPServer.
 func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
@@ -825,35 +880,111 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return configError{Field: "masquerade.proxy.url", Err: fmt.Errorf("unsupported protocol scheme \"%s\"", u.Scheme)}
 		}
-		transport := http.DefaultTransport
+
+		// 处理 RealIpHeader
+		c.Masquerade.Proxy.RealIpHeader = strings.TrimSpace(c.Masquerade.Proxy.RealIpHeader)
+		RealIpHeaderToLower := strings.ToLower(c.Masquerade.Proxy.RealIpHeader)
+		var proxyProtoVer int
+		switch RealIpHeaderToLower {
+		  case "proxy", "proxy protocol", "proxy_protocol":
+			  return configError{Field: "masquerade.proxy.RealIpHeader", Err: errors.New("invalid Real Ip Mode")}
+			case "v1", "proxy_v1", "proxy v1", "proxy_protocol_v1", "proxy protocol v1":
+				proxyProtoVer = 1
+			  // return configError{Field: "masquerade.proxy.RealIpHeader", Err: errors.New("unsupported send PROXY Protocol v1, Please Waiting for the next support.")}
+			case "v2", "proxy_v2", "proxy v2", "proxy_protocol_v2", "proxy protocol v2":
+				proxyProtoVer = 2
+			  // return configError{Field: "masquerade.proxy.RealIpHeader", Err: errors.New("unsupported send PROXY Protocol v2, Please Waiting for the next support.")}
+		}
+		// 自定义 Dial 逻辑：拦截连接并写入报头
+		customDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+			conn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			// 如果启用了 PROXY Protocol，则写入报头
+			if proxyProtoVer > 0 {
+				if originalRemote, ok := ctx.Value("remote-addr").(string); ok {
+					if err := writeProxyProtocol(conn, originalRemote, proxyProtoVer); err != nil {
+						conn.Close()
+						return nil, err
+					}
+				}
+			}
+			return conn, nil
+		}
+
+		// 配置 Transport
+		t := &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           customDialer,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+
 		if c.Masquerade.Proxy.Insecure {
-			transport = &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-				// use default configs from http.DefaultTransport
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
+			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+
+		// SNI 透传逻辑
+		if !c.Masquerade.Proxy.RewriteSNI && u.Scheme == "https" {
+			t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				plainConn, err := customDialer(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				cfg := t.TLSClientConfig.Clone()
+				if cfg == nil { cfg = &tls.Config{InsecureSkipVerify: c.Masquerade.Proxy.Insecure} }
+				
+				if reqSNI, ok := ctx.Value("proxy-sni").(string); ok && reqSNI != "" {
+					if host, _, err := net.SplitHostPort(reqSNI); err == nil {
+						cfg.ServerName = host
+					} else {
+						cfg.ServerName = reqSNI
+					}
+				}
+				tlsConn := tls.Client(plainConn, cfg)
+				return tlsConn, tlsConn.HandshakeContext(ctx)
 			}
 		}
+
 		handler = &httputil.ReverseProxy{
+			Transport: t,
 			Rewrite: func(r *httputil.ProxyRequest) {
+				// 注入 RemoteAddr 到 Context，供 DialContext 使用
+				ctx := context.WithValue(r.Out.Context(), "remote-addr", r.In.RemoteAddr)
+				// 处理 SNI
+				if !c.Masquerade.Proxy.RewriteSNI {
+					ctx = context.WithValue(ctx, "proxy-sni", r.In.TLS.ServerName)
+				}
+				*r.Out = *r.Out.WithContext(ctx)
+
 				r.SetURL(u)
 				// SetURL rewrites the Host header,
 				// but we don't want that if rewriteHost is false
 				if !c.Masquerade.Proxy.RewriteHost {
 					r.Out.Host = r.In.Host
 				}
+				// Get client real IP
+				ConnectIP, _, err := net.SplitHostPort(r.In.RemoteAddr)
+				if err != nil {ConnectIP = r.In.RemoteAddr}
+				// Set real IP header
+				switch RealIpHeaderToLower {
+					case "x-forwarded", "x-forwarded-for":
+						r.SetXForwarded()
+					case "false","disable","none", "": // do nothing
+					// PROXY Protocol // do nothing
+				  case "v1", "proxy_v1", "proxy v1", "proxy_protocol_v1", "proxy protocol v1", "v2", "proxy_v2", "proxy v2", "proxy_protocol_v2", "proxy protocol v2":
+				  case "x-real-ip":
+						r.Out.Header["X-Real-IP"] = []string{ConnectIP}
+					default:
+						// custom header (follow X-Real-IP semantics)
+						r.Out.Header[c.Masquerade.Proxy.RealIpHeader] = []string{ConnectIP}
+				}
 			},
-			Transport: transport,
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 				logger.Error("HTTP reverse proxy error", zap.Error(err))
 				w.WriteHeader(http.StatusBadGateway)
