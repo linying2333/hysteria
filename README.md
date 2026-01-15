@@ -1,3 +1,7 @@
+[本For新增/修改请读此中文文档](NewFeat.md)
+
+---
+
 # ![Hysteria 2](logo.svg)
 
 [![License][1]][2] [![Release][3]][4] [![Telegram][5]][6] [![Discussions][7]][8]

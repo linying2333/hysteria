@@ -172,6 +172,8 @@ func TestServerConfig(t *testing.T) {
 			Proxy: serverConfigMasqueradeProxy{
 				URL:         "https://some.site.net",
 				RewriteHost: true,
+				RewriteSni:  true,
+				RealIpHeader: "X-Forwarded-For",
 				Insecure:    true,
 			},
 			String: serverConfigMasqueradeString{
