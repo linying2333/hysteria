@@ -22,10 +22,12 @@ masquerade:
 - **类型**: 布尔值
 - **默认值**: `false`
 - 说明: |
+
   是否将发送给masquerade后端的SNI字段重写为`masquerade.proxy.url`的SNI
 
   **可选值**包括:
   - `false`: 表示连接masquerade时不进行重写, 透传远程客户端请求时提供的SNI字段 (仅 tls / https 协议生效, 无法获取将保持为空)
+
     设置后`false`程序会劫持 TLS 握手阶段，动态修改 Client Hello 中的 Server Name 字段为客户端提供的 SNI
   - `true`: 则客户端连接时的SNI字段将被替换为`masquerade.proxy.url`的SNI
 
@@ -50,11 +52,15 @@ masquerade:
 
 ### `realIpHeader`
 - **类型**: 字符串
+
   ~~**温馨提示**: 字符串类型的内容如果含有特殊符号请使用引号包裹防止解析出错~~
 - **默认值**: 无
+
   将不会传递客户端IP地址
 - **说明**: |
+
   指定用于传递客户端真实IP地址的HTTP头字段名称或协议类型
+
   **可选值**包括(除自定义头字段名称外不区分大小写):
   - `X-Forwarded`,`X-Forwarded-For`: 常用的HTTP源IP头字段, 用于追加/传递客户端IP地址链. 
     由go`httputil.ReverseProxy`自动处理, 发出时将会自动带上以下字段
@@ -86,6 +92,7 @@ masquerade:
   - `PROXY Protocol`,`PROXY_Protocol`: 保留字段`PROXY Protocol`, 不可用
   - `PROXY Protocol v1`,`PROXY_Protocol_v1`,`PROXY v1`,`PROXY_v1`,`v1`: 使用由HAProxy创造的PROXY协议v1纯文本格式在TCP/UDP中直接传递客户端IP地址
   - `PROXY Protocol v2`,`PROXY_Protocol_v2`,`PROXY v2`,`PROXY_v2`,`v2`: 使用由HAProxy创造的PROXY协议v2二进制格式在TCP/UDP中直接传递客户端IP地址
+  
     *注意*: 使用 PROXY Protocol 时，后端服务器（如 Nginx/Caddy）必须开启对应的PROXY Protocol接收开关，否则连接将会因为无法跳过该头部导致握手失败被连接重置, 进而发生最为常见的连接失败
   - **自定义头字段名称**: 可以指定任意自定义的HTTP头字段名称来传递客户端真实IP地址, 以英文半角连字符`-`作为字段分隔符, 该实现的行为与`X-Real-IP`完全一致
     示例格式如下:
